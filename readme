@@ -1,0 +1,48 @@
+📡 MoveMate 1.0
+This project is a multifunctional ESP32-based IoT system designed to monitor human activity (step counting), environmental conditions (temperature and humidity), and battery health, while supporting offline data storage, real-time data transmission via MQTT, OLED visualization, and web-based monitoring.
+
+🔧 Features
+Step Counting with MPU6050
+Detects walking and running steps based on calibrated thresholds.
+
+Temperature & Humidity Monitoring
+Reads values using the DHT11 sensor.
+
+OLED Display (SSD1306)
+Shows live step count, temperature, humidity, time, mode, and battery status.
+
+Wi-Fi Auto-Connect & MQTT Communication
+Connects to multiple known Wi-Fi networks and MQTT brokers to publish sensor data.
+
+Offline Data Logging (SPIFFS)
+Stores data locally when MQTT is unavailable and automatically resends it once reconnected.
+
+Battery Monitoring
+Calculates battery percentage and indicates low battery via LED alert.
+
+Time Synchronization (NTP)
+Retrieves and displays real-time clock data.
+
+Push Button Controls
+
+Start button to toggle modes (OFF → WALKING → RUNNING)
+
+Reset button to clear step count
+
+Web Interface via AsyncWebServer
+View live data or saved offline data through the ESP32's local web server.
+
+⚙️ Hardware Used
+ESP32 Dev Board
+
+MPU6050 Accelerometer
+
+DHT11 Temperature and Humidity Sensor
+
+SSD1306 OLED Display
+
+Push Buttons (Start and Reset)
+
+LED for battery alert
+
+Voltage divider for battery monitoring
