@@ -16,12 +16,12 @@
 
 
 // === Wi-Fi ===
-const char* ssidList[] = {"SLT-4G_1F19E2", "Desh_Iphone", "UOC_Staff" "Test", "desh"};
-const char* passwordList[] = {"2C20F0DD","12345678","admin106", "12345678", "12345678"};
+const char* ssidList[] = {};
+const char* passwordList[] = {};
 const int wifiCount = sizeof(ssidList) / sizeof(ssidList[0]);
 
 // === MQTT brokers ===
-const char* mqttServers[] = {"192.168.1.159", "172.20.10.2", "10.21.91.152","192.168.137.128","172.17.64.218"};
+const char* mqttServers[] = {};
 const int mqttPort = 1883;
 const char* mqttClientId = "ESP32_Pedometer";
 
