@@ -1,0 +1,518 @@
+// === Include libraries ===
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_GFX.h>
+#include <DHT11.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+#include <TimeLib.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncTCP.h>
+#include <SPIFFS.h>
+
+
+// === Wi-Fi ===
+const char* ssidList[] = {"SLT-4G_1F19E2", "Desh_Iphone", "UOC_Staff" "Test", "desh"};
+const char* passwordList[] = {"2C20F0DD","12345678","admin106", "12345678", "12345678"};
+const int wifiCount = sizeof(ssidList) / sizeof(ssidList[0]);
+
+// === MQTT brokers ===
+const char* mqttServers[] = {"192.168.1.159", "172.20.10.2", "10.21.91.152","192.168.137.128","172.17.64.218"};
+const int mqttPort = 1883;
+const char* mqttClientId = "ESP32_Pedometer";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// === NTP ===
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 19800); // GMT+5:30
+
+// === OLED ===
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// === MPU6050 ===
+Adafruit_MPU6050 mpu;
+
+// === DHT11 ===
+DHT11 dht11(4); // GPIO4
+
+// === Step Counting ===
+
+
+
+enum Mode { MODE_OFF, MODE_WALKING, MODE_RUNNING };
+Mode currentMode = MODE_OFF;
+bool countingEnabled = false;
+int stepCount = 0;
+unsigned long lastStepTime = 0;
+
+const float walkingThreshold = 1.2; // finding from calibration
+const float runningThreshold = 1.0;
+const unsigned long walkingDebounce = 400;
+const unsigned long runningDebounce = 200;
+
+// === Connection Status ===
+bool wifiConnected = false;
+bool mqttConnected = false;
+int currentWiFiIndex = -1;
+
+// === WebServer ===
+AsyncWebServer server(80);
+String stepsStr = "0";
+String tempStr = "0";
+String humidityStr = "0";
+String timeStr = "--:--:--";
+
+// === Display control ===
+bool displayOn = false;
+//unsigned long displayTimeout = 5000; // 5 seconds to sleep
+unsigned long lastDisplayTime = 0;
+
+
+// === MQTT reconnect timing ===
+unsigned long lastMqttReconnectAttempt = 0;
+const unsigned long mqttReconnectInterval = 5000;
+
+// battery presentage
+
+#define BATTERY_PIN 34
+const float MAX_BATTERY_VOLTAGE = 4.2; // Fully charged
+const float MIN_BATTERY_VOLTAGE = 2.0; // Considered discharged
+
+// battery low led
+#define LOW_BATTERY_LED_PIN 35
+
+
+// === Push Buttons ===
+#define BUTTON_START_PIN 25
+#define BUTTON_RESET_PIN 26
+
+//bool countingEnabled = false;
+bool lastStartButtonState = HIGH;
+bool lastResetButtonState = HIGH;
+unsigned long lastDebounceTimeStart = 0;
+unsigned long lastDebounceTimeReset = 0;
+const unsigned long debounceDelay = 20;
+
+
+// === WiFi Setup ===
+void setupWiFi() {
+  Serial.println("Scanning WiFi...");
+  int n = WiFi.scanNetworks();
+  if (n == 0) {
+    Serial.println("No networks found");
+    wifiConnected = false;
+    return;
+  }
+
+  for (int i = 0; i < wifiCount; i++) {
+    for (int j = 0; j < n; j++) {
+      if (WiFi.SSID(j) == ssidList[i]) {
+        Serial.print("Attempting to connect to ");
+        Serial.println(ssidList[i]);
+
+        WiFi.begin(ssidList[i], passwordList[i]);
+
+        unsigned long startAttemptTime = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
+          delay(500);
+          Serial.print(".");
+        }
+
+        if (WiFi.status() == WL_CONNECTED) {
+          Serial.println("\nConnected to WiFi!");
+          Serial.print("IP Address: ");
+          Serial.println(WiFi.localIP());
+          wifiConnected = true;
+          currentWiFiIndex = i;
+          return;
+        } else {
+          Serial.println("\nFailed to connect to ");
+          Serial.println(ssidList[i]);
+          WiFi.disconnect();
+          delay(1000);
+        }
+      }
+    }
+  }
+
+  Serial.println("No known networks could be connected.");
+  wifiConnected = false;
+}
+
+void resendOfflineData() {
+  File file = SPIFFS.open("/offline_data.txt", FILE_READ);
+  if (!file || file.size() == 0) {
+    file.close();
+    return;
+  }
+
+  Serial.println("Resending offline data...");
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    client.publish("esp32/sensors", line.c_str());
+    delay(100);
+  }
+  file.close();
+  SPIFFS.remove("/offline_data.txt");
+  Serial.println("Offline data sent and file cleared.");
+}
+
+void reconnectMQTT() {
+  if (!client.connected()) {
+    Serial.print("Connecting to MQTT...");
+    if (client.connect(mqttClientId)) {
+      Serial.println("connected!");
+      mqttConnected = true;
+      resendOfflineData();
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      mqttConnected = false;
+    }
+  }
+}
+
+int getBatteryPercentage() {
+  int analogValue = analogRead(BATTERY_PIN);
+  float voltage = analogValue * (3.3 / 4095.0) * 2; //voltage divider is used
+  int percentage = (int)((voltage - MIN_BATTERY_VOLTAGE) / (MAX_BATTERY_VOLTAGE - MIN_BATTERY_VOLTAGE) * 100.0);
+  percentage = constrain(percentage, 0, 100);
+  return percentage;
+}
+
+void updateDisplay(int temp, int hum) {
+
+  int batteryPercentage = getBatteryPercentage();
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.print("Steps: ");
+  display.println(stepCount);
+  display.setCursor(0, 12);
+  display.print("Temp: ");
+  display.print(temp);
+  display.println(" C");
+  display.setCursor(0, 24);
+  display.print("Humidity: ");
+  display.print(hum);
+  display.println(" %");
+  display.setCursor(0, 36);
+  display.print("Time: ");
+  display.println(timeStr);
+  display.setCursor(0, 58);
+  display.print("Mode: ");
+  switch (currentMode) {
+    case MODE_OFF: display.println("OFF"); break;
+    case MODE_WALKING: display.println("Walking"); break;
+    case MODE_RUNNING: display.println("Running"); break;
+  }
+
+  if (batteryPercentage < 20) {
+    digitalWrite(LOW_BATTERY_LED_PIN, HIGH);  // Turn on LED
+    display.setCursor(0, 48);
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.println("LOW BATTERY!");
+  } else {
+    digitalWrite(LOW_BATTERY_LED_PIN, LOW);   // Turn off LED
+    if (!wifiConnected) {
+      display.setCursor(0, 48);
+      display.println("WiFi Error");
+    } else if (!mqttConnected) {
+      display.setCursor(0, 48);
+      display.println("MQTT Error");
+    } else {
+      display.setCursor(0, 48);
+      display.print("Battery: ");
+      display.print(batteryPercentage);
+      display.println("%");
+    }
+  }
+
+  display.display();
+  
+}
+
+
+void detectStep(float x, float y, float z) {
+  if (!countingEnabled) return;
+  static float prevMagnitude = 0;
+  float magnitude = sqrt(x*x + y*y + z*z);
+  float delta = abs(magnitude - prevMagnitude);
+
+  float threshold = (currentMode == MODE_RUNNING) ? runningThreshold : walkingThreshold;
+
+  Serial.print("Delta: ");
+  Serial.print(delta);
+  Serial.print(", Threshold: ");
+  Serial.println(threshold);
+
+ unsigned long debounce = (currentMode == MODE_RUNNING) ? runningDebounce : walkingDebounce;
+
+if (delta > threshold && (millis() - lastStepTime > debounce)) {
+  stepCount++;
+  lastStepTime = millis();
+  Serial.print("Step detected! Total steps: ");
+  Serial.println(stepCount);
+}
+  prevMagnitude = magnitude;
+}
+
+
+void publishData(int temp, int hum) {
+  int batteryPercentage = getBatteryPercentage();
+  char payload[160];
+  snprintf(payload, sizeof(payload),
+           "{\"steps\":%d,\"temperature\":%d,\"humidity\":%d,\"battery\":%d,\"time\":\"%s\"}",
+           stepCount, temp, hum, batteryPercentage, timeStr.c_str());
+
+  if (mqttConnected) {
+    client.publish("esp32/sensors", payload);
+  } else {
+    File file = SPIFFS.open("/offline_data.txt", FILE_APPEND);
+    if (!file) {
+      Serial.println("Failed to open file for writing");
+      return;
+    }
+    file.println(payload);
+    file.close();
+    Serial.println("Saved data offline: ");
+    Serial.println(payload);
+  }
+}
+
+void handleButtons() {
+  static bool lastStartState = HIGH;
+  static bool lastResetState = HIGH;
+
+  bool startState = digitalRead(BUTTON_START_PIN);
+  bool resetState = digitalRead(BUTTON_RESET_PIN);
+
+  if (startState == LOW && lastStartState == HIGH) {
+    currentMode = static_cast<Mode>((currentMode + 1) % 3);
+    Serial.print("Mode changed to: ");
+    switch (currentMode) {
+      case MODE_OFF: 
+        Serial.println("OFF"); 
+        countingEnabled = false;  // disable counting
+        break;
+      case MODE_WALKING: 
+        Serial.println("WALKING"); 
+        countingEnabled = true;   // enable counting
+        break;
+      case MODE_RUNNING: 
+        Serial.println("RUNNING"); 
+        countingEnabled = true;   // enable counting
+        break;
+    }
+  }
+  lastStartState = startState;
+
+  if (resetState == LOW && lastResetState == HIGH) {
+    stepCount = 0;
+    Serial.println("Step count RESET");
+  }
+  lastResetState = resetState;
+}
+
+
+
+
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  SPIFFS.begin(true);
+  displayOn = true; 
+
+  Serial.println("Initializing buttons...");
+  pinMode(BUTTON_START_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_RESET_PIN, INPUT_PULLUP);
+  Serial.println("Buttons initialized");
+
+
+
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED not found");
+    while (1);
+  }
+  display.clearDisplay();
+  display.display();
+
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not found");
+    while (1);
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
+  mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_5_HZ);
+
+  currentMode = MODE_OFF;  // Start in OFF mode, counting disabled
+  countingEnabled = false;
+
+  setupWiFi();
+
+  if (wifiConnected) {
+    client.setServer(mqttServers[currentWiFiIndex], mqttPort);
+    reconnectMQTT();
+  }
+
+  timeClient.begin();
+  if (wifiConnected) {
+    while (!timeClient.update()) {
+      timeClient.forceUpdate();
+    }
+    setTime(timeClient.getEpochTime());
+  }
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+   String html = "<!DOCTYPE html><html><head><meta http-equiv='refresh' content='5'/><title>ESP32 Live Data</title></head><body>";
+    html += "<h2>ESP32 Live Sensor Data</h2>";
+    html += "<p>Steps: " + String(stepCount) + "</p>";
+    html += "<p>Temperature: " + tempStr + " °C</p>";
+    html += "<p>Humidity: " + humidityStr + " %</p>";
+    html += "<p>Battery: " + String(getBatteryPercentage()) + " %</p>";
+    html += "<p>Time: " + timeStr + "</p>";
+    html += "<p>Mode: ";
+    switch (currentMode) {
+      case MODE_OFF: html += "OFF"; break;
+      case MODE_WALKING: html += "WALKING"; break;
+      case MODE_RUNNING: html += "RUNNING"; break;
+    }
+    html += "</p>";
+    html += "</body></html>";
+    request->send(200, "text/html", html);
+  });
+
+server.on("/view-offline", HTTP_GET, [](AsyncWebServerRequest *request){
+  if (!SPIFFS.exists("/offline_data.txt")) {
+    request->send(404, "text/plain", "No offline data found");
+    return;
+  }
+
+  File file = SPIFFS.open("/offline_data.txt", FILE_READ);
+  String content = "<html><body><h2>Offline Data</h2><pre>";
+  while (file.available()) {
+    content += file.readStringUntil('\n') + "\n";
+  }
+  content += "</pre></body></html>";
+  file.close();
+  
+  request->send(200, "text/html", content);
+});
+
+
+
+  server.begin();
+
+  // battery low
+
+  pinMode(LOW_BATTERY_LED_PIN, OUTPUT);
+  digitalWrite(LOW_BATTERY_LED_PIN, LOW);
+
+
+
+
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    wifiConnected = false;
+    setupWiFi();
+    if (wifiConnected) {
+      client.setServer(mqttServers[currentWiFiIndex], mqttPort);
+      reconnectMQTT();
+      timeClient.begin();
+      timeClient.forceUpdate();
+      setTime(timeClient.getEpochTime());
+    }
+  }
+
+  if (!client.connected() && wifiConnected) {
+    if (millis() - lastMqttReconnectAttempt > mqttReconnectInterval) {
+      reconnectMQTT();
+      lastMqttReconnectAttempt = millis();
+    }
+  }
+  client.loop();
+
+  if (wifiConnected && timeClient.update()) {
+    setTime(timeClient.getEpochTime());
+  }
+
+ 
+
+
+
+  //sensors_event_t a, g, tempEvent;
+
+  sensors_event_t a, g, tempEvent;
+  mpu.getEvent(&a, &g, &tempEvent);
+  Serial.print("Accel X: "); Serial.print(a.acceleration.x);
+  Serial.print(" Y: "); Serial.print(a.acceleration.y);
+  Serial.print(" Z: "); Serial.println(a.acceleration.z);
+
+  
+  handleButtons();  // Always check buttons
+
+  if (countingEnabled) {
+  sensors_event_t a, g, tempEvent;
+  mpu.getEvent(&a, &g, &tempEvent);
+  detectStep(a.acceleration.x, a.acceleration.y, a.acceleration.z);
+  delay(100);
+  }
+
+ 
+
+  int temperature = 0, humidity = 0;
+  int result = dht11.readTemperatureHumidity(temperature, humidity);
+
+  if (result == 0) {
+    timeStr = wifiConnected ? timeClient.getFormattedTime() : "--:--:--";
+    updateDisplay(temperature, humidity);
+    publishData(temperature, humidity);
+  } else {
+    Serial.print("DHT11 error: ");
+    Serial.println(DHT11::getErrorString(result));
+  }
+
+  stepsStr = String(stepCount);
+  tempStr = String(temperature);
+  humidityStr = String(humidity);
+
+
+
+  delay(1000);
+
+Serial.print("Step Count: ");
+Serial.print(stepCount);
+Serial.print(" | Mode: ");
+
+switch (currentMode) {
+  case MODE_OFF:
+    Serial.println("OFF");
+    break;
+  case MODE_WALKING:
+    Serial.println("WALKING");
+    break;
+  case MODE_RUNNING:
+    Serial.println("RUNNING");
+    break;
+}
+
+
+
+
+}
