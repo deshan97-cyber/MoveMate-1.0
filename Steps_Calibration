@@ -1,0 +1,153 @@
+import paho.mqtt.client as mqtt
+import pandas as pd
+import matplotlib.pyplot as plt
+import json
+import time
+import numpy as np
+from scipy.signal import find_peaks
+
+# === MQTT Settings ===
+mqtt_broker = ""
+mqtt_port = 1883
+mqtt_topic = "esp32/magnitude"
+
+# === File Paths ===
+csv_path = r""
+steps_path = r""
+
+# === Step Detection Parameters ===
+alpha = 0.9
+step_interval_ms = 300  # Minimum time between steps
+
+# === Containers ===
+timestamps = []
+magnitudes = []
+filtered = []
+step_times = []
+
+# === Internal Variables ===
+prev_filtered = 0
+rising = False
+last_step_time = 0
+
+# === MQTT Callback ===
+def on_message(client, userdata, message):
+    global prev_filtered, rising, last_step_time
+    payload = message.payload.decode("utf-8")
+    
+    try:
+        sensor_data = json.loads(payload)
+        timestamp = sensor_data.get("timestamp")
+        magnitude = sensor_data.get("magnitude")
+
+        if timestamp is not None and magnitude is not None:
+            ts_ms = timestamp * 1000
+            timestamps.append(ts_ms)
+            magnitudes.append(magnitude)
+
+            # Low-pass filtering
+            if not filtered:
+                f_mag = magnitude
+            else:
+                f_mag = alpha * filtered[-1] + (1 - alpha) * magnitude
+            filtered.append(f_mag)
+
+            # Peak detection for immediate step detection (optional, here just storing for later)
+            if f_mag > prev_filtered:
+                rising = True
+            elif rising and f_mag < prev_filtered:
+                rising = False
+                # We don't use peak_threshold here because we want to calculate it later
+                # But keep last_step_time to avoid double counting peaks
+                last_step_time = ts_ms
+
+            prev_filtered = f_mag
+
+    except json.JSONDecodeError:
+        print("Error decoding JSON")
+
+# === Save Data and Steps to CSV ===
+def save_all_data(detected_steps_list):
+    if timestamps:
+        df = pd.DataFrame({
+            "Timestamp (ms)": timestamps,
+            "Magnitude": magnitudes,
+            "Filtered Magnitude": filtered
+        })
+        df.to_csv(csv_path, index=False)
+        print(f"Saved magnitude data to: {csv_path}")
+
+        steps_df = pd.DataFrame({
+            "Step Timestamp (ms)": detected_steps_list,
+            "Step Time (s)": np.array(detected_steps_list) / 1000.0
+        })
+        steps_df.to_csv(steps_path, index=False)
+        print(f"Saved step data to: {steps_path}")
+    else:
+        print("No data collected.")
+
+# === MQTT Setup ===
+client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+client.on_message = on_message
+client.connect(mqtt_broker, mqtt_port, 60)
+client.subscribe(mqtt_topic)
+client.loop_start()
+
+print("Collecting data... Press Ctrl+C to stop.")
+try:
+    while True:
+        time.sleep(1)
+
+except KeyboardInterrupt:
+    print("\nStopping data collection...")
+    client.loop_stop()
+    client.disconnect()
+
+    # Process collected data to find threshold and detect steps
+    if filtered:
+        filtered_array = np.array(filtered)
+        timestamps_array = np.array(timestamps)
+
+        # Find all peaks, enforcing a minimum distance between peaks (samples)
+        # Approximate samples distance: step_interval_ms / average sampling interval (assumed ~200ms here)
+        min_distance_samples = int(step_interval_ms / 200) if step_interval_ms >= 200 else 1
+        all_peaks, _ = find_peaks(filtered_array, distance=min_distance_samples)
+
+        peak_vals = filtered_array[all_peaks]
+
+        # Calculate threshold from peaks (mean minus half std deviation, tune as needed)
+        calculated_threshold = peak_vals.mean() - 0.5 * peak_vals.std()
+        print(f"Calculated threshold from data: {calculated_threshold:.3f}")
+
+        # Detect steps: peaks above threshold and respecting minimum step interval time
+        detected_steps = []
+        last_step_time = 0
+
+        for peak_idx in all_peaks:
+            peak_value = filtered_array[peak_idx]
+            peak_time = timestamps_array[peak_idx]
+            if peak_value > calculated_threshold and (peak_time - last_step_time) > step_interval_ms:
+                detected_steps.append(peak_time)
+                last_step_time = peak_time
+
+        print(f"Total steps detected using calculated threshold: {len(detected_steps)}")
+
+        # Save all data and detected steps
+        save_all_data(detected_steps)
+
+        # Plotting
+        plt.figure(figsize=(12,6))
+        plt.plot(filtered_array, label="Filtered Magnitude")
+        plt.plot(all_peaks, peak_vals, "o", label="All Peaks")
+        detected_indices = [np.argmin(np.abs(timestamps_array - t)) for t in detected_steps]
+        plt.plot(detected_indices, filtered_array[detected_indices], "rx", label="Detected Steps")
+        plt.axhline(y=calculated_threshold, color='g', linestyle='--', label=f"Threshold = {calculated_threshold:.3f}")
+        plt.title("Step Threshold Calculation and Step Detection")
+        plt.xlabel("Sample Number")
+        plt.ylabel("Magnitude")
+        plt.legend()
+        plt.grid()
+        plt.show()
+
+    else:
+        print("No filtered data available for threshold calculation.")
