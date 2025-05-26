@@ -1,0 +1,496 @@
+// === Include libraries ===
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_GFX.h>
+#include <DHT11.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+#include <TimeLib.h>
+#include <SPIFFS.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+
+// === Wi-Fi ===
+const char* ssidList[] = {};
+const char* passwordList[] = {};
+const int wifiCount = sizeof(ssidList) / sizeof(ssidList[0]);
+
+// === MQTT brokers ===
+const char* mqttServers[] = {};
+const int mqttPort = 1883;
+const char* mqttClientId = "ESP32_Pedometer";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// === NTP ===
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 19800); // GMT+5:30
+
+// === OLED ===
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// === MPU6050 ===
+Adafruit_MPU6050 mpu;
+
+// === DHT11 ===
+DHT11 dht11(4); // GPIO4
+
+// === Step Counting ===
+int stepCount = 0;
+unsigned long lastStepTime = 0;
+const float stepThreshold = 1.2;
+
+// === Connection Status ===
+bool wifiConnected = false;
+bool mqttConnected = false;
+int currentWiFiIndex = -1;
+
+
+// Firebase credentials
+#define API_KEY ""
+#define DATABASE_URL ""
+#define USER_EMAIL ""
+#define USER_PASSWORD ""
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+String timeStr = "--:--:--";
+String stepsStr = "";
+String tempStr = "";
+String humidityStr = "";
+
+// === Display control ===
+bool displayOn = false;
+unsigned long displayTimeout = 5000; // 5 seconds to sleep
+unsigned long lastDisplayTime = 0;
+unsigned long lastDisplayUpdate = 0;
+const unsigned long displayUpdateInterval = 2000;
+
+// === MQTT reconnect timing ===
+unsigned long lastMqttReconnectAttempt = 0;
+const unsigned long mqttReconnectInterval = 5000;
+
+// battery presentage
+
+#define BATTERY_PIN 34
+const float MAX_BATTERY_VOLTAGE = 4.2; // Fully charged
+const float MIN_BATTERY_VOLTAGE = 2.0; // Considered discharged
+
+// === Push Buttons ===
+#define BUTTON_START_PIN 25
+#define BUTTON_RESET_PIN 26
+
+bool countingEnabled = false;
+bool lastStartButtonState = HIGH;
+bool lastResetButtonState = HIGH;
+unsigned long lastDebounceTimeStart = 0;
+unsigned long lastDebounceTimeReset = 0;
+const unsigned long debounceDelay = 20;
+
+
+// === WiFi Setup ===
+void setupWiFi() {
+  Serial.println("Scanning WiFi...");
+  int n = WiFi.scanNetworks();
+  if (n == 0) {
+    Serial.println("No networks found");
+    wifiConnected = false;
+    return;
+  }
+
+  for (int i = 0; i < wifiCount; i++) {
+    for (int j = 0; j < n; j++) {
+      if (WiFi.SSID(j) == ssidList[i]) {
+        Serial.print("Attempting to connect to ");
+        Serial.println(ssidList[i]);
+
+        WiFi.begin(ssidList[i], passwordList[i]);
+
+        unsigned long startAttemptTime = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
+          delay(500);
+          Serial.print(".");
+        }
+
+        if (WiFi.status() == WL_CONNECTED) {
+          Serial.println("\nConnected to WiFi!");
+          Serial.print("IP Address: ");
+          Serial.println(WiFi.localIP());
+          wifiConnected = true;
+          currentWiFiIndex = i;
+          return;
+        } else {
+          Serial.println("\nFailed to connect to ");
+          Serial.println(ssidList[i]);
+          WiFi.disconnect();
+          delay(1000);
+        }
+      }
+    }
+  }
+
+  Serial.println("No known networks could be connected.");
+  wifiConnected = false;
+  
+}
+
+void resendOfflineDataToFirebase() {
+  File file = SPIFFS.open("/offline_data.txt", FILE_READ);
+  if (!file || file.size() == 0) {
+    file.close();
+    return;
+  }
+
+  Serial.println("Resending offline data to Firebase...");
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    FirebaseJson json;
+    json.set("data", line); 
+    String path = "/esp32/offline_data"; 
+
+    // Send data to Firebase
+    if (Firebase.RTDB.pushJSON(&fbdo, path.c_str(), &json)) {
+      Serial.println("Data sent to Firebase.");
+    } else {
+      Serial.print("Failed to send to Firebase: ");
+      Serial.println(fbdo.errorReason());
+    }
+    delay(100);
+  }
+  file.close();
+  SPIFFS.remove("/offline_data.txt"); // Clear offline data after sending
+  Serial.println("Offline data sent and file cleared.");
+}
+
+
+void reconnectMQTT() {
+  if (!client.connected()) {
+    Serial.print("Connecting to MQTT...");
+    if (client.connect(mqttClientId)) {
+      Serial.println("connected!");
+      mqttConnected = true;
+      resendOfflineDataToFirebase();
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      mqttConnected = false;
+    }
+  }
+}
+
+int getBatteryPercentage() {
+  int analogValue = analogRead(BATTERY_PIN);
+  float voltage = analogValue * (3.3 / 4095.0) * 2; //voltage divider is used
+  int percentage = (int)((voltage - MIN_BATTERY_VOLTAGE) / (MAX_BATTERY_VOLTAGE - MIN_BATTERY_VOLTAGE) * 100.0);
+  percentage = constrain(percentage, 0, 100);
+  return percentage;
+}
+
+
+
+void updateDisplay(int temp, int hum) {
+  
+   int batteryPercentage = getBatteryPercentage();
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.print("Steps: ");
+  display.println(stepCount);
+  display.setCursor(0, 12);
+  display.print("Temp: ");
+  display.print(temp);
+  display.println(" C");
+  display.setCursor(0, 24);
+  display.print("Humidity: ");
+  display.print(hum);
+  display.println(" %");
+  display.setCursor(0, 36);
+  display.print("Time: ");
+  display.println(timeStr);
+  display.setCursor(0, 58);
+  display.print("Mode: ");
+  display.println(countingEnabled ? "ON" : "OFF");
+  
+  if (!wifiConnected) {
+  display.setCursor(0, 48);
+  display.println("WiFi Error");
+  } else if (!mqttConnected) {
+  display.setCursor(0, 48);
+  display.println("MQTT Error");
+  } else {
+  display.setCursor(0, 48);
+  display.print("Battery: ");
+  display.print(batteryPercentage);
+  display.println("%");
+  }
+  
+display.display();
+
+}
+
+// Step Algorithm//
+
+void detectStep(float x, float y, float z) {
+  const float alpha = 0.9;               // Smoothing factor for low-pass filter
+  const float peakThreshold = 1.2;       // Adjust based on your sensor/data
+  const unsigned long stepInterval = 300; // Minimum time between steps (ms)
+
+  static float filteredMagnitude = 0;
+  static float prevFiltered = 0;
+  static bool rising = false;
+  static unsigned long lastStepTime = 0;
+
+  // Calculate acceleration magnitude
+  float magnitude = sqrt(x * x + y * y + z * z);
+
+  // Remove gravity to get net acceleration (optional)
+  float netMag = abs(magnitude - 9.81);
+
+  // Low-pass filter to smooth signal
+  filteredMagnitude = alpha * filteredMagnitude + (1 - alpha) * netMag;
+
+  // Peak detection logic
+  if (filteredMagnitude > prevFiltered) {
+    rising = true; // Signal is rising
+  } else if (rising && filteredMagnitude < prevFiltered) {
+    rising = false; // We have reached a peak
+
+    if (prevFiltered > peakThreshold && (millis() - lastStepTime > stepInterval)) {
+      stepCount++;
+      lastStepTime = millis();
+
+      // Optional: Wake display
+      displayOn = true;
+      lastDisplayTime = millis();
+    }
+  }
+
+  prevFiltered = filteredMagnitude;
+}
+
+
+void publishData(int temp, int hum) {
+  int batteryPercentage = getBatteryPercentage();
+  char payload[160];
+  snprintf(payload, sizeof(payload),
+           "{\"steps\":%d,\"temperature\":%d,\"humidity\":%d,\"battery\":%d,\"time\":\"%s\"}",
+           stepCount, temp, hum, batteryPercentage, timeStr.c_str());
+
+  if (mqttConnected) {
+    client.publish("esp32/sensors", payload);
+    sendToFirebase(stepCount, temp, hum, batteryPercentage, timeStr);
+
+  } else {
+    File file = SPIFFS.open("/offline_data.txt", FILE_APPEND);
+    if (!file) {
+      Serial.println("Failed to open file for writing");
+      return;
+    }
+    file.println(payload);
+    file.close();
+    Serial.println("Saved data offline: ");
+    Serial.println(payload);
+  }
+}
+
+void handleButtons() {
+  static bool lastStartState = HIGH;
+  static bool lastResetState = HIGH;
+
+  bool startState = digitalRead(BUTTON_START_PIN);
+  bool resetState = digitalRead(BUTTON_RESET_PIN);
+
+  // Start Button Pressed
+  if (startState == LOW && lastStartState == HIGH) {
+    countingEnabled = !countingEnabled;
+    Serial.print("Counting is now ");
+    Serial.println(countingEnabled ? "ENABLED" : "DISABLED");
+  }
+  lastStartState = startState;
+
+  // Reset Button Pressed
+  if (resetState == LOW && lastResetState == HIGH) {
+    stepCount = 0;
+    Serial.println("Step count RESET");
+  }
+  lastResetState = resetState;
+}
+
+
+void sendToFirebase(int steps, int temperature, int humidity, int battery, String timeStr) {
+   if (!Firebase.ready()) {
+    Serial.println("Firebase not ready");
+    return;
+  }
+
+  String path = "/esp32/data";  
+  
+
+  FirebaseJson json;
+  json.set("steps", steps);
+  json.set("temperature", temperature);
+  json.set("humidity", humidity);
+  json.set("battery", battery);
+  json.set("time", timeStr);
+
+  if (Firebase.RTDB.setJSON(&fbdo, path.c_str(), &json)) {
+    Serial.println("Data sent to Firebase");
+  } else {
+    Serial.print("Firebase send failed: ");
+    Serial.println(fbdo.errorReason());
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  SPIFFS.begin(true);
+  displayOn = true; 
+
+
+  Serial.println("Initializing buttons...");
+  pinMode(BUTTON_START_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_RESET_PIN, INPUT_PULLUP);
+  Serial.println("Buttons initialized");
+
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED not found");
+    while (1);
+  }
+  display.clearDisplay();
+  display.display();
+
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not found");
+    while (1);
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
+  mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_5_HZ);
+
+  setupWiFi();
+
+  if (wifiConnected) {
+    client.setServer(mqttServers[currentWiFiIndex], mqttPort);
+    reconnectMQTT();
+    resendOfflineDataToFirebase(); // Upload offline data when Wi-Fi is restored
+  }
+
+  timeClient.begin();
+  if (wifiConnected) {
+    while (!timeClient.update()) {
+      timeClient.forceUpdate();
+    }
+    setTime(timeClient.getEpochTime());
+  }
+
+
+ // Firebase setup
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  // Wait for Firebase to initialize (up to 10 seconds)
+  unsigned long startTime = millis();
+  while (!Firebase.ready() && millis() - startTime < 10000) {
+    delay(100);
+}
+
+
+}
+
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    wifiConnected = false;
+    setupWiFi();
+    if (wifiConnected) {
+      client.setServer(mqttServers[currentWiFiIndex], mqttPort);
+      reconnectMQTT();
+      timeClient.begin();
+      timeClient.forceUpdate();
+      setTime(timeClient.getEpochTime());
+    }
+  }
+
+  if (!client.connected() && wifiConnected) {
+    if (millis() - lastMqttReconnectAttempt > mqttReconnectInterval) {
+      reconnectMQTT();
+      lastMqttReconnectAttempt = millis();
+    }
+  }
+  client.loop();
+
+  if (wifiConnected && timeClient.update()) {
+    setTime(timeClient.getEpochTime());
+  }
+
+  // Ensure that offline data is uploaded when connection is restored
+  if (wifiConnected && client.connected()) {
+    resendOfflineDataToFirebase();
+  }
+
+  if (wifiConnected && timeClient.update()) {
+    setTime(timeClient.getEpochTime());
+  }
+
+  handleButtons();  // Always check buttons
+
+  if (countingEnabled) {
+  sensors_event_t a, g, tempEvent;
+  mpu.getEvent(&a, &g, &tempEvent);
+  detectStep(a.acceleration.x, a.acceleration.y, a.acceleration.z);
+  }
+
+ 
+
+  int temperature = 0, humidity = 0;
+  int result = dht11.readTemperatureHumidity(temperature, humidity);
+  timeStr = wifiConnected ? timeClient.getFormattedTime() : "--:--:--";
+
+  if (result == 0) {
+    
+    updateDisplay(temperature, humidity);
+    publishData(temperature, humidity);
+  } else {
+    Serial.print("DHT11 error: ");
+    Serial.println(DHT11::getErrorString(result));
+    updateDisplay(temperature, humidity);  // Still update with last known or zero values
+  }
+
+  stepsStr = String(stepCount);
+  tempStr = String(temperature);
+  humidityStr = String(humidity);
+
+  if (millis() - lastDisplayUpdate > displayUpdateInterval) {
+    updateDisplay(temperature, humidity);
+    lastDisplayUpdate = millis();
+  }
+
+  delay(1000);
+
+  Serial.print("Step Count: ");
+  Serial.print(stepCount);
+  Serial.print(" | Mode: ");
+  Serial.println(countingEnabled ? "ON" : "OFF");
+
+}
